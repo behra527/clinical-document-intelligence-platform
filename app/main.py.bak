@@ -1,0 +1,193 @@
+import hashlib
+import json
+import logging
+import os
+import uuid
+from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Header
+from fastapi.responses import JSONResponse
+from sqlalchemy import select
+from app.core.config import DATA_DIR, MAX_UPLOAD_BYTES, API_KEY
+from app.core.database import Base, engine, SessionLocal, DocumentRecord, AuditRecord
+from app.core.models import DocumentResult
+from app.services.detection import detect_type
+from app.services.pipeline import process_document
+
+log = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    Base.metadata.create_all(bind=engine)
+    yield
+
+app = FastAPI(title='Clinical AI Document Ingestion', version='0.1.0', lifespan=lifespan)
+
+
+def require_api_key(x_api_key: str | None = Header(default=None)):
+    if not API_KEY:
+        raise HTTPException(503, 'CLINICAL_API_KEY must be configured')
+    import secrets
+    if not x_api_key or not secrets.compare_digest(x_api_key, API_KEY):
+        raise HTTPException(401, 'Invalid API key')
+
+
+def audit(db, doc_id, action):
+    db.add(AuditRecord(document_id=doc_id, action=action))
+
+@app.get('/health')
+def health():
+    return {'status': 'ok'}
+
+@app.post('/api/v1/documents', response_model=DocumentResult, dependencies=[Depends(require_api_key)], status_code=201)
+async def upload_document(file: UploadFile = File(...)):
+    if not file.filename:
+        raise HTTPException(400, 'Filename required')
+    filename = Path(file.filename.replace('\\', '/')).name[:255]
+    if not filename or filename in ('.', '..'):
+        raise HTTPException(400, 'Invalid filename')
+    # Stream in bounded chunks rather than trusting Content-Length.
+    chunks, size, digest = [], 0, hashlib.sha256()
+    while chunk := await file.read(1024 * 1024):
+        size += len(chunk)
+        if size > MAX_UPLOAD_BYTES:
+            raise HTTPException(413, 'File exceeds configured upload limit')
+        digest.update(chunk)
+        chunks.append(chunk)
+    if size == 0:
+        raise HTTPException(400, 'Empty document')
+    data = b''.join(chunks)
+    try:
+        file_type, mime_type = detect_type(data)
+    except ValueError as exc:
+        raise HTTPException(415, str(exc)) from exc
+    document_id = str(uuid.uuid4())
+    directory = DATA_DIR / 'uploads'
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = directory / document_id
+    with path.open('xb') as handle:
+        os.chmod(path, 0o600)
+        handle.write(data)
+    try:
+        result = process_document(document_id, filename, mime_type, digest.hexdigest(), size, file_type, path)
+    except Exception as exc:
+        log.warning('Extraction failed: doc=%s error=%s', document_id, type(exc).__name__)
+        result = DocumentResult(document_id=document_id, status='failed', filename=filename, mime_type=mime_type, sha256=digest.hexdigest(), size_bytes=size, warnings=[f'Extraction failed: {type(exc).__name__}'], review_status='pending')
+    with SessionLocal() as db:
+        db.add(DocumentRecord(id=document_id, filename=filename, mime_type=mime_type, sha256=digest.hexdigest(), size_bytes=size, status=result.status, review_status=result.review_status, storage_path=str(path), result_json=result.model_dump_json()))
+        audit(db, document_id, 'uploaded_and_processed')
+        db.commit()
+    return result
+
+@app.get('/api/v1/documents', dependencies=[Depends(require_api_key)])
+def list_documents():
+    with SessionLocal() as db:
+        records = db.scalars(select(DocumentRecord).order_by(DocumentRecord.created_at.desc()).limit(100)).all()
+        return [{'document_id': r.id, 'filename': r.filename, 'status': r.status, 'review_status': r.review_status} for r in records]
+
+@app.get('/api/v1/documents/{document_id}', response_model=DocumentResult, dependencies=[Depends(require_api_key)])
+def get_document(document_id: str):
+    with SessionLocal() as db:
+        record = db.get(DocumentRecord, document_id)
+        if record is None: raise HTTPException(404, 'Document not found')
+        audit(db, document_id, 'result_viewed')
+        db.commit()
+        return DocumentResult.model_validate_json(record.result_json)
+
+@app.post('/api/v1/documents/{document_id}/review', response_model=DocumentResult, dependencies=[Depends(require_api_key)])
+def review_document(document_id: str, decision: str):
+    if decision not in ('approved', 'rejected'):
+        raise HTTPException(422, 'decision must be approved or rejected')
+    with SessionLocal() as db:
+        record = db.get(DocumentRecord, document_id)
+        if record is None: raise HTTPException(404, 'Document not found')
+        if record.review_status != 'pending': raise HTTPException(409, 'Document is not pending review')
+        result = DocumentResult.model_validate_json(record.result_json)
+        result.review_status = decision
+        record.review_status = decision
+        record.result_json = result.model_dump_json()
+        audit(db, document_id, f'review_{decision}')
+        db.commit()
+        return result
+
+# Phase 1.2: reviewer action on a single candidate; original OCR text is immutable.
+from typing import Literal
+from pydantic import BaseModel, Field
+from app.services.normalization import normalize_candidate
+
+class EntityReviewRequest(BaseModel):
+    decision: Literal['verified', 'rejected']
+    corrected_text: str | None = Field(default=None, min_length=1, max_length=2000)
+    note: str | None = Field(default=None, max_length=2000)
+
+@app.patch('/api/v1/documents/{document_id}/entities/{entity_index}', response_model=DocumentResult, dependencies=[Depends(require_api_key)])
+def review_entity(document_id: str, entity_index: int, request: EntityReviewRequest):
+    with SessionLocal() as db:
+        record = db.get(DocumentRecord, document_id)
+        if record is None:
+            raise HTTPException(404, 'Document not found')
+        result = DocumentResult.model_validate_json(record.result_json)
+        if not 0 <= entity_index < len(result.clinical_entities):
+            raise HTTPException(404, 'Clinical entity not found')
+        if record.review_status in ('approved', 'rejected'):
+            raise HTTPException(409, 'Document review already finalized')
+        entity = result.clinical_entities[entity_index]
+        if entity.status != 'candidate':
+            raise HTTPException(409, 'Entity has already been reviewed')
+        if request.decision == 'rejected' and request.corrected_text is not None:
+            raise HTTPException(422, 'Correction is only valid when verifying an entity')
+        entity.status = request.decision
+        entity.corrected_text = request.corrected_text
+        entity.reviewer_note = request.note
+        if request.corrected_text is not None:
+            entity.normalized = normalize_candidate(entity.label, request.corrected_text)
+        # Entity review does not imply document approval.
+        result.review_status = 'pending'
+        record.review_status = 'pending'
+        record.result_json = result.model_dump_json()
+        audit(db, document_id, f'entity_{entity_index}_{request.decision}')
+        db.commit()
+        return result
+
+# Phase 2.1: authenticated original PDF preview
+from fastapi.responses import FileResponse
+
+@app.get(
+    "/api/v1/documents/{document_id}/original",
+    dependencies=[Depends(require_api_key)]
+)
+def preview_original_pdf(document_id: str):
+    with SessionLocal() as db:
+        record = db.get(DocumentRecord, document_id)
+
+        if record is None:
+            raise HTTPException(404, "Document not found")
+
+        if record.mime_type != "application/pdf":
+            raise HTTPException(415, "Preview supports PDF documents only")
+
+        uploads_dir = (DATA_DIR / "uploads").resolve()
+        original_path = Path(record.storage_path).resolve()
+
+        # Never serve arbitrary filesystem paths.
+        if (
+            original_path.parent != uploads_dir
+            or original_path.name != document_id
+        ):
+            raise HTTPException(403, "Invalid document storage path")
+
+        if not original_path.is_file():
+            raise HTTPException(404, "Original PDF is unavailable")
+
+        audit(db, document_id, "original_pdf_viewed")
+        db.commit()
+
+        return FileResponse(
+            path=str(original_path),
+            media_type="application/pdf",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Disposition": "inline"
+            }
+        )

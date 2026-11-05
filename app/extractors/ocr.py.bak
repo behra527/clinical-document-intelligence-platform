@@ -1,0 +1,47 @@
+from pathlib import Path
+from PIL import Image, ImageOps
+import pytesseract
+from pytesseract import Output
+from app.core.models import PageResult, TextBlock
+from .base import BaseExtractor
+
+
+def ocr_image(image: Image.Image, page_number: int):
+    image = ImageOps.exif_transpose(image).convert('RGB')
+    if image.width * image.height > 30_000_000:
+        raise ValueError('Image exceeds OCR pixel limit')
+    data = pytesseract.image_to_data(image, output_type=Output.DICT, config='--psm 3')
+    # Tesseract provides explicit block/paragraph/line IDs. Do not merge
+    # across columns or sections based on y-coordinates alone.
+    groups = {}
+    for i, raw in enumerate(data['text']):
+        word = raw.strip()
+        if not word:
+            continue
+        key = tuple(data[k][i] for k in ('block_num', 'par_num', 'line_num'))
+        conf = float(data['conf'][i])
+        x, y, w, h = (int(data[k][i]) for k in ('left', 'top', 'width', 'height'))
+        groups.setdefault(key, []).append((word, x, y, x+w, y+h, conf))
+    blocks = []
+    for words in groups.values():
+        text = ' '.join(w[0] for w in words)
+        valid = [w[5] for w in words if w[5] >= 0]
+        bbox = [min(w[1] for w in words), min(w[2] for w in words),
+                max(w[3] for w in words), max(w[4] for w in words)]
+        blocks.append(TextBlock(block_id=f'p{page_number}-b{len(blocks)+1}',
+            text=text, page_number=page_number, source_method='tesseract',
+            bbox=bbox, confidence=round(sum(valid)/len(valid)/100, 4) if valid else None))
+    return PageResult(page_number=page_number, blocks=blocks)
+
+
+class ImageExtractor(BaseExtractor):
+    def extract(self, path: Path):
+        pages = []
+        with Image.open(path) as image:
+            count = getattr(image, 'n_frames', 1)
+            if count > 100:
+                raise ValueError('Too many image frames')
+            for i in range(count):
+                image.seek(i)
+                pages.append(ocr_image(image.copy(), i+1))
+        return pages, {'page_count': len(pages)}, []

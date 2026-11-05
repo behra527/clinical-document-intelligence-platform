@@ -1,0 +1,15 @@
+1. Copy app/api/document_management.py to D:\clinical-ai-platform\app\api\document_management.py
+2. Backup app/main.py.
+3. Add these two lines at the END of app/main.py:
+
+from app.api.document_management import router as document_management_router
+app.include_router(document_management_router)
+
+4. Restart backend. Do not add duplicate lines.
+
+Routes:
+PATCH /api/v1/documents/{id}/metadata    {"filename":"report.pdf"}
+POST  /api/v1/documents/{id}/review-status {"status":"pending"}
+DELETE /api/v1/documents/{id}
+
+IMPORTANT: Deletion permanently removes the DB document and upload file. For production use, replace hard deletion with soft deletion and durable audit retention. These routes are intended for local demo only; require real user login and role authorization in production.

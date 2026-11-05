@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - '127.0.0.1:8000:8000'
+    environment:
+      CLINICAL_API_KEY: ${CLINICAL_API_KEY:?Set CLINICAL_API_KEY}
+      CLINICAL_DATA_DIR: /app/data
+    volumes:
+      - clinical_data:/app/data
+    restart: unless-stopped
+volumes:
+  clinical_data:

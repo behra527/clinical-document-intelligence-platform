@@ -1,0 +1,36 @@
+from pathlib import Path
+from app.core.models import DocumentResult
+from app.extractors.pdf import PdfExtractor
+from app.extractors.docx import DocxExtractor
+from app.extractors.text import TextExtractor
+from app.extractors.ocr import ImageExtractor
+from .nlp import extract_candidates
+from .normalization import normalize_candidate, find_frequency
+
+EXTRACTORS = {
+    'pdf': PdfExtractor(), 'docx': DocxExtractor(),
+    'txt': TextExtractor(), 'html': TextExtractor(html=True),
+    'png': ImageExtractor(), 'jpeg': ImageExtractor(), 'tiff': ImageExtractor()
+}
+
+def process_document(document_id: str, filename: str, mime_type: str, sha256: str, size_bytes: int, file_type: str, path: Path) -> DocumentResult:
+    pages, metadata, warnings = EXTRACTORS[file_type].extract(path)
+    metadata = dict(metadata)
+    metadata['detected_format'] = file_type
+    metadata['extraction_methods'] = sorted({block.source_method for page in pages for block in page.blocks})
+    if not pages or not any(block.text.strip() for page in pages for block in page.blocks):
+        warnings.append('No readable text extracted; manual review required')
+    ocr_conf = [b.confidence for p in pages for b in p.blocks if b.confidence is not None]
+    if ocr_conf and sum(ocr_conf)/len(ocr_conf) < .65:
+        warnings.append('Low average OCR confidence; manual review required')
+    entities = extract_candidates(pages)
+    frequency = find_frequency(pages)
+    for entity in entities:
+        entity.normalized = normalize_candidate(entity.label, entity.text)
+        if entity.label == 'medication' and frequency:
+            entity.normalized['frequency'] = frequency
+    block_lookup = {b.block_id: b for page in pages for b in page.blocks}
+    if any(block_lookup[e.block_id].confidence is not None and block_lookup[e.block_id].confidence < .90 for e in entities):
+        warnings.append('Low-confidence clinical entity text; manual review required')
+    status = 'review_required' if warnings else 'completed'
+    return DocumentResult(document_id=document_id, status=status, filename=filename, mime_type=mime_type, sha256=sha256, size_bytes=size_bytes, metadata=metadata, pages=pages, clinical_entities=entities, warnings=warnings, review_status='pending' if warnings else 'not_required')
